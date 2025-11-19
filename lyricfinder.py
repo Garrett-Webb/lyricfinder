@@ -24,7 +24,7 @@ AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".aac", ".ogg", ".wav"}
 LRCLIB_BASE_URL = "https://lrclib.net"
 REQUEST_TIMEOUT = 15  # seconds
 SLEEP_BETWEEN_REQUESTS = 0.3  # be gentle to the API
-
+CHECKED_ALBUMS_FILENAME = ".checked_albums.txt"
 
 # ---- Helpers ----------------------------------------------------------------
 
@@ -258,13 +258,49 @@ def write_lrc_for_track(
     except Exception as e:
         logger.error("Failed to write %s: %s", lrc_path, e)
 
+# ---- helpers for redundancy checker -----------------------------------------
+
+
+def load_checked_albums(root: Path) -> set[str]:
+    """
+    Load the set of album paths (relative to root) that have already been checked.
+    """
+    path = root / CHECKED_ALBUMS_FILENAME
+    if not path.exists():
+        return set()
+
+    albums = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            albums.add(line)
+    return albums
+
+
+def save_checked_albums(root: Path, new_albums: set[str]) -> None:
+    """
+    Append newly checked albums to the log file at the root.
+    """
+    if not new_albums:
+        return
+
+    path = root / CHECKED_ALBUMS_FILENAME
+    with path.open("a", encoding="utf-8") as f:
+        for album in sorted(new_albums):
+            f.write(album + "\n")
+
+
 
 # ---- Main logic -------------------------------------------------------------
 
 
 def process_library(root: Path, overwrite: bool, logger: logging.Logger) -> None:
     session = requests.Session()
-
+    
+    checked_albums = load_checked_albums(root)
+    logger.info("Loaded %d previously checked albums", len(checked_albums))
+    new_checked_albums: set[str] = set()
+    
     for path in root.rglob("*"):
         if not path.is_file():
             continue
@@ -275,10 +311,24 @@ def process_library(root: Path, overwrite: bool, logger: logging.Logger) -> None
 
         if path.suffix.lower() not in AUDIO_EXTS:
             continue
+        
+        # Album key = directory containing the track, relative to root
+        try:
+            album_rel = str(path.parent.relative_to(root))
+        except ValueError:
+            # Fallback in weird cases
+            album_rel = str(path.parent)	
+		
+        # If this album has already been checked in a previous run, skip
+        if album_rel in checked_albums and not overwrite:
+            logger.debug("Album already checked, skipping: %s (%s)", album_rel, path)
+            continue
 
         lrc_path = path.with_suffix(".lrc")
         if lrc_path.exists() and not overwrite:
             logger.debug("LRC exists, skipping: %s", path)
+            if album_rel not in checked_albums:
+                new_checked_albums.add(album_rel)
             continue
 
         artist, title, album, duration = get_metadata(path, root)
@@ -295,6 +345,11 @@ def process_library(root: Path, overwrite: bool, logger: logging.Logger) -> None
             duration=duration,
             logger=logger,
         )
+		
+		# We attempted an API lookup for this album, mark it as checked.
+        # (Only matters for future runs; current run still processes all tracks.)
+        if album_rel not in checked_albums:
+            new_checked_albums.add(album_rel)
 
         if not lyrics:
             logger.warning("No lyrics found for %s", path)
@@ -304,6 +359,10 @@ def process_library(root: Path, overwrite: bool, logger: logging.Logger) -> None
 
         # Be nice to the API
         time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+    save_checked_albums(root, new_checked_albums)
+    logger.info("Recorded %d newly checked albums", len(new_checked_albums))
+
 
 
 def main(argv=None) -> int:
